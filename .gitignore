@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+env/
+venv/
+ENV/
+
+# Environment & Secrets
+.env
+backend/.env
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build / Temp
+node_modules/
+package-lock.json
+*.log
+error.log
+
+# Reports (generated at runtime)
+reports/
+
+# Large binaries
+frontend/assets/app-debug.apk
+bin/
+
+# One-off utility scripts
+frontend/fix_config.py
+frontend/fix_themes.py
+frontend/patch_ui.py
+frontend/update_css.py
+frontend/update_ui.py
+
+# Gemini agent
+.gemini/

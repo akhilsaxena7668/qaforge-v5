@@ -1,0 +1,640 @@
+"""
+QAForge Gemini — AI Engine v5.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KEY v5 CHANGE: Focus areas now strictly filter what categories the AI generates.
+  - If focus_areas = ["security", "negative"] → AI ONLY generates security + negative tests
+  - format_config drives output format (BDD, Detailed, Checklist, Exploratory)
+  - Depth param on bug scan controls scan thoroughness
+"""
+
+import uuid, json, re, base64, asyncio
+from pathlib import Path
+from datetime import datetime
+from typing import List, Tuple, Optional, Any
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    import google.generativeai as genai
+from .models import GenerateRequest, TestSuite, TestCase, RangeConfig, FormatConfig
+
+# ── Model chain ───────────────────────────────────────────────────────────────
+MODEL_CHAIN: List[Tuple[str, str]] = [
+    ("flash2",    "gemini-3-flash-preview"),
+    ("pro",       "gemini-3-flash-preview"),
+    ("flash",     "gemini-2.5-flash"),
+    ("flash_exp", "gemini-3-flash-preview"),
+]
+
+MODEL_LABELS = {
+    "gemini-3-flash-preview": "gemini-3-flash-preview",
+    "gemini-3-flash-preview": "gemini-3-flash-preview",
+    "gemini-1.5-flash":     "gemini-2.5-flash",
+    "gemini-2.0-flash-exp": "Gemini 2.0 Flash Exp",
+}
+
+QUOTA_ERRORS = ("quota", "429", "resource exhausted", "rate limit", "too many requests", "exceeded", "billing")
+
+# Focus area → category labels for AI prompt
+FOCUS_LABELS = {
+    "ui":            "UI/UX (visual layout, interactions, responsive design, animations, forms, navigation)",
+    "happy_path":    "Happy Path (standard successful user flows, expected use cases, normal workflows)",
+    "negative":      "Negative Testing (invalid inputs, boundary values, empty fields, error handling, edge cases)",
+    "functional":    "Functional (core business logic, CRUD, feature verification, data processing)",
+    "security":      "Security (SQL injection, XSS, CSRF, auth bypass, privilege escalation, data exposure)",
+    "performance":   "Performance (page load, API response time, stress testing, concurrent users, memory leaks)",
+    "accessibility": "Accessibility (WCAG 2.1 AA compliance, ARIA labels, keyboard nav, screen reader, color contrast)",
+    "api":           "API/Backend (HTTP methods, status codes, request/response validation, error handling, pagination)",
+    "regression":    "Regression (previously working features, post-change validation, backward compatibility)",
+    "integration":   "Integration (third-party services, cross-module flows, data sync, webhooks, SSO)",
+}
+
+# Category mappings for JSON output
+FOCUS_TO_CATEGORY = {
+    "ui": "ui",
+    "happy_path": "functional",
+    "negative": "functional",
+    "functional": "functional",
+    "security": "security",
+    "performance": "performance",
+    "accessibility": "accessibility",
+    "api": "api",
+    "regression": "functional",
+    "integration": "functional",
+}
+
+
+def _is_quota(err: str) -> bool:
+    return any(q in err.lower() for q in QUOTA_ERRORS)
+
+
+def _parse(text: str) -> Any:
+    text = text.strip()
+    # Remove obvious wrappers
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+    
+    # Attempt iterative parsing
+    decoder = json.JSONDecoder()
+    for i in range(len(text)):
+        if text[i] in "[{":
+            try:
+                # Try raw_decode first as it's more resilient to extra trailing text
+                res, _ = decoder.raw_decode(text[i:])
+                return res
+            except:
+                continue
+    
+    # Fallback to standard loads to get a good error message if all else fails
+    return json.loads(text)
+
+
+def _distribute_range(rc: Optional[RangeConfig], n: int) -> List[RangeConfig]:
+    """
+    Distribute a total range exactly across n batches, handling remainders.
+    (e.g., 71 tests / 4 batches = [18, 18, 18, 17])
+    """
+    if not rc:
+        return [RangeConfig(min_tests=5, max_tests=8) for _ in range(n)]
+
+    def split_val(total, count):
+        if total is None: return [None] * count
+        base = total // count
+        rem = total % count
+        return [base + (1 if i < rem else 0) for i in range(count)]
+
+    mins   = split_val(rc.min_tests, n)
+    maxs   = split_val(rc.max_tests, n)
+    crits  = split_val(rc.critical_count, n)
+    highs  = split_val(rc.high_count, n)
+    meds   = split_val(rc.medium_count, n)
+    lows   = split_val(rc.low_count, n)
+
+    return [
+        RangeConfig(
+            min_tests=mins[i], max_tests=maxs[i],
+            critical_count=crits[i], high_count=highs[i],
+            medium_count=meds[i], low_count=lows[i]
+        )
+        for i in range(n)
+    ]
+
+
+def _build_range_instruction(rc: Optional[RangeConfig]) -> str:
+    if not rc:
+        return "Generate exactly 15 test cases."
+    
+    if rc.min_tests == rc.max_tests:
+        lines = [f"CRITICAL: You MUST generate EXACTLY {rc.max_tests} test cases. No more, no fewer."]
+    else:
+        lines = [f"Generate between {rc.min_tests} and {rc.max_tests} test cases (aim for {rc.max_tests})."]
+        
+    dist = []
+    if rc.critical_count is not None: dist.append(f"{rc.critical_count} CRITICAL priority")
+    if rc.high_count     is not None: dist.append(f"{rc.high_count} HIGH priority")
+    if rc.medium_count   is not None: dist.append(f"{rc.medium_count} MEDIUM priority")
+    if rc.low_count      is not None: dist.append(f"{rc.low_count} LOW priority")
+    if dist:
+        lines.append("MANDATORY Priority distribution: " + ", ".join(dist) + ".")
+    return " ".join(lines)
+
+
+def _build_focus_instruction(focus_areas: Optional[List[str]]) -> str:
+    """
+    CRITICAL: Build a strict instruction that forces the AI to ONLY
+    generate test cases for the selected focus areas — nothing else.
+    """
+    if not focus_areas:
+        return ""
+
+    selected = [FOCUS_LABELS.get(f, f) for f in focus_areas]
+    allowed_cats = list(set(FOCUS_TO_CATEGORY.get(f, "functional") for f in focus_areas))
+    focus_str = "\n  - ".join(selected)
+
+    return f"""
+
+══════════════════════════════════════════════════════
+CRITICAL FOCUS AREA RESTRICTION — STRICTLY ENFORCED:
+══════════════════════════════════════════════════════
+You MUST ONLY generate test cases for these {len(focus_areas)} selected focus area(s):
+  - {focus_str}
+
+DO NOT generate any test cases for other focus areas.
+DO NOT include tests that don't belong to the selected categories.
+EVERY test case's "category" field must be one of: {", ".join(focus_areas)}
+
+Distribute the test cases proportionally across the selected areas.
+If only 1 area is selected, ALL tests must cover that area deeply.
+══════════════════════════════════════════════════════"""
+
+
+def _build_format_instruction(fmt: Optional[FormatConfig]) -> str:
+    """Build format-specific instructions for how test cases should be structured."""
+    if not fmt:
+        return ""
+
+    base_instructions = {
+        "detailed": "Write detailed test cases with clear step-by-step actions and specific expected results per step.",
+        "bdd": "Write test steps in BDD/Gherkin format: Given [precondition], When [action], Then [expected]. Use this format for every step.",
+        "exploratory": "Write as exploratory testing charters: Mission statement, target areas, resources, and risk coverage rather than scripted steps.",
+        "checklist": "Write as concise checklist items. Steps should be single action items. Keep everything brief and scannable.",
+    }
+
+    fmt_inst = base_instructions.get(fmt.format, "")
+    field_inst = ""
+    if fmt.fields:
+        field_inst = f"\nOnly include these fields in each test: {', '.join(fmt.fields)}."
+    custom = f"\nAdditional format instructions: {fmt.instructions}" if fmt.instructions else ""
+
+    return f"\n\nFORMAT INSTRUCTIONS: {fmt_inst}{field_inst}{custom}"
+
+
+def _build_suite(data: dict, source: str, model_name: str, url: Optional[str] = None,
+                 rc: Optional[RangeConfig] = None) -> TestSuite:
+    sid = str(uuid.uuid4())
+    tests = [
+        TestCase(
+            id=t.get("id", f"TC-{i+1:03d}"),
+            name=t.get("name", "Unnamed"),
+            category=t.get("category", "functional"),
+            priority=t.get("priority", "medium"),
+            description=t.get("description", ""),
+            preconditions=t.get("preconditions", []),
+            steps=t.get("steps", []),
+            expected_result=t.get("expected_result", ""),
+            tags=t.get("tags", []),
+            model_used=MODEL_LABELS.get(model_name, model_name),
+        )
+        for i, t in enumerate(data.get("tests", []))
+    ]
+    return TestSuite(
+        id=sid,
+        name=data.get("suite_name", "Generated Suite"),
+        description=data.get("description", ""),
+        app_type=data.get("app_type", "web"),
+        source=source, source_url=url,
+        created_at=datetime.now().isoformat(),
+        model_used=MODEL_LABELS.get(model_name, model_name),
+        range_min=rc.min_tests if rc else len(tests),
+        range_max=rc.max_tests if rc else len(tests),
+        tests=tests,
+    )
+
+
+SYSTEM_PROMPT = """You are QAForge, an expert QA engineer. OUTPUT ONLY valid JSON — no markdown, no backticks, no explanation.
+
+VISUAL GROUNDING & ACCURACY:
+- Identify specific UI components mentioned (e.g., "Account Settings icon", "App Launcher", "Submit button").
+- Describe actions relative to these components.
+- For visual/image analysis, be extremely precise about the location and appearance of elements.
+
+Required JSON structure:
+{{
+  "suite_name": "string",
+  "description": "string",
+  "app_type": "web|desktop|mobile",
+  "tests": [
+    {{
+      "id": "TC-001",
+      "name": "string (Scenario Title)",
+      "scenario": "string (Detailed scenario description)",
+      "category": "functional|ui|security|performance|accessibility|api|usability",
+      "priority": "critical|high|medium|low",
+      "severity": "blocker|critical|major|minor",
+      "preconditions": ["string"],
+      "test_input": "string (Specific data inputs required)",
+      "steps": [{{"step": 1, "action": "string", "expected": "string"}}],
+      "expected_result": "string",
+      "tags": ["string"]
+    }}
+  ]
+}}
+
+Rules:
+- Each test must have 3–10 concrete steps with specific actions and expected results
+- Be precise and actionable — no vague steps
+- Include realistic input data for forms and search bars
+- Include both happy path and failure scenarios within selected focus areas only
+- {range_instruction}{focus_instruction}{format_instruction}{depth_instruction}"""
+
+BUG_SYSTEM = """You are QAForge BugScanner. OUTPUT ONLY valid JSON — no markdown, no backticks.
+{{
+  "scan_title": "string",
+  "risk_level": "critical|high|medium|low",
+  "total_issues": number,
+  "bugs": [{{
+    "id": "BUG-001",
+    "title": "string",
+    "severity": "critical|high|medium|low|info",
+    "category": "security|performance|functional|ui|accessibility|data|logic|compatibility",
+    "description": "string",
+    "location": "string",
+    "impact": "string",
+    "steps_to_reproduce": ["string"],
+    "fix_suggestion": "string",
+    "cwe": "string",
+    "tags": ["string"]
+  }}],
+  "summary": "string",
+  "recommendations": ["string"]
+}}
+{depth_instruction}"""
+
+DEPTH_INSTRUCTIONS = {
+    "quick":    "Find the 5-10 most obvious, high-impact bugs. Focus on critical paths only.",
+    "standard": "Find 10-15 realistic bugs covering security, performance, UX, and logic errors.",
+    "deep":     "Find 15-25 bugs with deep analysis. Include edge cases, obscure security issues, accessibility violations, and subtle logic flaws.",
+    "paranoid": "Find 20-30+ bugs with paranoid thoroughness. Every potential vulnerability, every UX friction point, every performance anti-pattern, every accessibility issue. Leave nothing unchecked.",
+}
+
+GEN_DEPTH_INSTRUCTIONS = {
+    "quick":    "Focus on high-level functional flows and primary happy paths. Keep steps concise.",
+    "standard": "Provide balanced coverage of features and UI interactions. Include basic edge cases and validation steps.",
+    "deep":     "Perform deep analysis of the UI and logic. Identify specific components (menus, buttons, icons). Generate granular test cases with detailed micro-interactions (hovers, validation of state changes, error handling).",
+    "paranoid": "Leave no stone unturned. Generate exhaustive tests for every possible state transition, boundary condition, and obscure interaction. Focus on heavy visual grounding and precise validation of all UI elements.",
+}
+
+
+class AIEngine:
+    def __init__(self, store: dict):
+        self.store = store
+        self._quota: dict = {}
+
+    def _get_keys(self) -> dict:
+        cfg = self.store.get("config", {})
+        keys = {}
+        for i in range(1, 5):
+            k = cfg.get(f"api_key_{i}", "").strip()
+            if k:
+                keys[i] = k
+        single = cfg.get("api_key", "").strip()
+        if single and 1 not in keys:
+            keys[1] = single
+        return keys
+
+    def _try(self, prompt: str, image_data=None, prefer_key: Optional[str] = None) -> Tuple[str, str]:
+        keys = self._get_keys()
+        if not keys:
+            raise ValueError("No Gemini API key configured. Add a key in Settings.")
+
+        # Create a mapping of model_key to its original slot index
+        key_to_slot = {item[0]: i + 1 for i, item in enumerate(MODEL_CHAIN)}
+
+        if prefer_key:
+            ordered = [(k, m) for k, m in MODEL_CHAIN if k == prefer_key]
+            ordered += [(k, m) for k, m in MODEL_CHAIN if k != prefer_key]
+        else:
+            ordered = list(MODEL_CHAIN)
+
+        all_errors = []
+        for mkey, mname in ordered:
+            if self._quota.get(mkey):
+                all_errors.append(f"{mname}: quota exhausted")
+                continue
+            
+            slot = key_to_slot.get(mkey, 1)
+            api_key = keys.get(slot) or keys.get(1)
+            
+            if not api_key:
+                all_errors.append(f"{mname}: no api key for slot {slot}")
+                continue
+            try:
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel(
+                    mname,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.4, top_p=0.95, max_output_tokens=16384
+                    )
+                )
+                content = ([image_data, prompt] if image_data else [prompt])
+                resp = model.generate_content(content)
+                self._quota[mkey] = False
+                print(f"[QAForge] Used {mname} (Slot {slot})")
+                return resp.text, mname
+            except Exception as e:
+                err_msg = str(e)
+                all_errors.append(f"{mname} (Slot {slot}): {err_msg[:100]}")
+                if _is_quota(err_msg):
+                    self._quota[mkey] = True
+                    continue
+                continue
+
+        raise RuntimeError(f"Models exhausted. Errors: {'; '.join(all_errors)}")
+
+    def _build_prompt(self, rc, focus_areas, format_config=None, depth="standard", extra="") -> str:
+        """Build a complete prompt with focus + format + depth instructions injected."""
+        ri = _build_range_instruction(rc)
+        fi = _build_focus_instruction(focus_areas)
+        fmti = _build_format_instruction(format_config)
+        di = "\n\nDEPTH LEVEL: " + GEN_DEPTH_INSTRUCTIONS.get(depth, GEN_DEPTH_INSTRUCTIONS["standard"])
+        return SYSTEM_PROMPT.format(
+            range_instruction=ri,
+            focus_instruction=fi,
+            format_instruction=fmti,
+            depth_instruction=di
+        ) + extra
+
+    async def _generate_batched(self, req: GenerateRequest, source: str, url: Optional[str] = None, image_data=None, extra_context="") -> TestSuite:
+        rc = req.range_config
+        max_tests = rc.max_tests if rc else 15
+        
+        # Performance optimization: if 25 or fewer tests, one call is fine.
+        # If more, we split into parallel batches of ~20 to speed up generation.
+        if max_tests <= 25:
+            prompt = self._build_prompt(rc, req.focus_areas, req.format_config, req.depth, extra_context)
+            text, mname = await asyncio.to_thread(self._try, prompt, image_data, req.model) # type: ignore
+            return _build_suite(_parse(text), source, mname, url, rc)
+
+        batch_size = 20
+        num_batches = (max_tests + batch_size - 1) // batch_size
+        print(f"[QAForge] Splitting {max_tests} tests into {num_batches} parallel batches...")
+        
+        # Fairly distribute the target range across all batches
+        batch_configs = _distribute_range(rc, num_batches)
+
+        async def run_batch(idx):
+            b_rc = batch_configs[idx]
+            if b_rc.max_tests <= 0:
+                return {"tests": []}, "none"
+            
+            # Unique instruction to prevent duplicate tests
+            batch_ctx = extra_context + f"\n\n[PARALLEL BATCH {idx+1}/{num_batches}]\nFOCUS: Ensure these tests are unique and distinct from other batches. Focus area variation #{idx+1}."
+            prompt = self._build_prompt(b_rc, req.focus_areas, req.format_config, req.depth, batch_ctx)
+            
+            try:
+                text, mname = await asyncio.to_thread(self._try, prompt, image_data, req.model) # type: ignore
+                return _parse(text), mname
+            except Exception as e:
+                print(f"[QAForge] Batch {idx+1} failed: {e}")
+                return {"tests": []}, "error"
+
+        results = await asyncio.gather(*(run_batch(i) for i in range(num_batches)))
+        
+        merged_tests = []
+        final_mname = "Multiple"
+        for data, mname in results:
+            merged_tests.extend(data.get("tests", []))
+            if mname != "error": final_mname = mname
+            
+        # Re-index for consistent IDs across batches
+        for i, t in enumerate(merged_tests):
+            t["id"] = f"TC-{i+1:03d}"
+            
+        first_data = results[0][0] if results else {}
+        combined_data = {
+            "suite_name": first_data.get("suite_name", "Generated Suite"),
+            "description": first_data.get("description", "Parallel batched generation"),
+            "app_type": req.app_type,
+            "tests": merged_tests
+        }
+        return _build_suite(combined_data, source, final_mname, url, rc)
+
+    async def _generate_swarm(self, req: GenerateRequest, source: str, url: Optional[str] = None, image_data=None, extra_context="") -> TestSuite:
+        import asyncio
+        agents = req.agents or []
+        if not agents:
+            return _build_suite({"tests": []}, source, "None", url, req.range_config)
+
+        num_agents = len(agents)
+        rc = req.range_config
+        
+        # Fairly distribute the target range across all agents
+        agent_configs = _distribute_range(rc, num_agents)
+
+        AGENT_PERSONAS = {
+            "security": "You are a Security Testing Expert. Focus EXCLUSIVELY on vulnerabilities, XSS, injection, authentication bypass, data leaks, and security misconfigurations. Look for edge cases that compromise the system.",
+            "ux": "You are a UX/UI Testing Expert. Focus EXCLUSIVELY on user experience, accessibility, responsive design, visual feedback, clear navigation, and frustrating user flows.",
+            "performance": "You are a Performance Testing Expert. Focus EXCLUSIVELY on load times, bottlenecks, concurrent actions, memory leaks, and optimizing resource usage.",
+            "logic": "You are a Functional QA Lead. Focus EXCLUSIVELY on core business logic, happy paths, complex state transitions, and integration between components.",
+            "data": "You are a Data Validation Expert. Focus EXCLUSIVELY on boundary values, invalid inputs, data integrity, format mismatches, and corner cases."
+        }
+
+        async def run_agent(idx, agent_name):
+            persona = AGENT_PERSONAS.get(agent_name, f"You are a specialized {agent_name} testing expert.")
+            # Build agent-specific prompt with reduced range target
+            b_rc = agent_configs[idx]
+            if b_rc.max_tests <= 0:
+                return {"tests": []}
+            
+            agent_prompt = self._build_prompt(b_rc, req.focus_areas, req.format_config, req.depth, extra_context)
+            agent_prompt += f"\n\n[MULTI-AGENT SWARM INSTRUCTION]\n{persona}\nYour output MUST be restricted to the {agent_name} persona focus."
+            
+            try:
+                text, mname = await asyncio.to_thread(self._try, agent_prompt, image_data, req.model)  # type: ignore
+                parsed = _parse(text)
+                for t in parsed.get("tests", []):
+                    t["category"] = agent_name # Override category to reflect the agent
+                return parsed
+            except Exception as e:
+                print(f"[QAForge] Agent {agent_name} failed: {e}")
+                return {"tests": []}
+
+        results = await asyncio.gather(*(run_agent(i, a) for i, a in enumerate(agents)))
+        
+        merged_tests = []
+        for res in results:
+            merged_tests.extend(res.get("tests", []))  # type: ignore
+            
+        for i, t in enumerate(merged_tests):
+            t["id"] = f"TC-{i+1:03d}"
+            
+        suite_name = results[0].get("suite_name", "Swarm Generated Suite") if results and results[0].get("suite_name") else "Swarm Generated Suite"  # type: ignore
+        desc = "Multi-Agent Swarm combined test suite from: " + ", ".join(agents)
+        
+        combined_data = {
+            "suite_name": f"{suite_name} (Swarm)",
+            "description": desc,
+            "app_type": results[0].get("app_type", req.app_type) if results else req.app_type,  # type: ignore
+            "tests": merged_tests
+        }
+        
+        return _build_suite(combined_data, source, "Multi-Agent Swarm", url, rc)
+    # ── URL ───────────────────────────────────────────────────────────────────
+    async def generate_from_url(self, req: GenerateRequest) -> TestSuite:
+        extra = f"\n\nApplication URL: {req.url}\nApp Type: {req.app_type}\n" \
+                f"Description: {req.description or 'Not provided'}\n\n" \
+                "Analyze the URL structure, infer user flows, and generate tests covering only the selected focus areas."
+
+        if req.is_multi_agent and req.agents:
+            return await self._generate_swarm(req, f"url:{req.url}", req.url, extra_context=extra)
+            
+        return await self._generate_batched(req, f"url:{req.url}", req.url, extra_context=extra)
+
+    # ── TEXT ──────────────────────────────────────────────────────────────────
+    async def generate_from_text(self, req: GenerateRequest) -> TestSuite:
+        extra = f"\n\nApp Type: {req.app_type}\nDescription: {req.description}\n\n" \
+                "Think deeply about all user interactions, edge cases, and failure modes " \
+                "but ONLY for the selected focus areas."
+
+        if req.is_multi_agent and req.agents:
+            return await self._generate_swarm(req, "text", None, extra_context=extra)
+            
+        return await self._generate_batched(req, "text", None, extra_context=extra)
+
+    # ── IMAGE ─────────────────────────────────────────────────────────────────
+    async def generate_from_image(self, b64: str, media_type: str, app_type: str,
+                                   description: str, focus_areas: List[str],
+                                   rc: Optional[RangeConfig] = None,
+                                   is_multi_agent: bool = False,
+                                   agents: List[str] = None,
+                                   model: str = None,
+                                   depth: str = "standard") -> TestSuite:
+        extra = f"\n\nAnalyze this {app_type} application screenshot carefully.\n" \
+                f"Context: {description or 'None provided'}\n\n" \
+                "but ONLY for the selected focus areas above."
+
+        req = GenerateRequest(app_type=app_type, description=description, focus_areas=focus_areas, range_config=rc, is_multi_agent=is_multi_agent, agents=agents, model=model, depth=depth)
+        img = {"mime_type": media_type, "data": base64.b64decode(b64)}
+        
+        if is_multi_agent and agents:
+            return await self._generate_swarm(req, "image", None, image_data=img, extra_context=extra)
+            
+        return await self._generate_batched(req, "image", None, image_data=img, extra_context=extra)
+
+    # ── VIDEO ─────────────────────────────────────────────────────────────────
+    async def generate_from_video(self, b64: str, media_type: str, app_type: str,
+                                   description: str, focus_areas: List[str],
+                                   rc: Optional[RangeConfig] = None,
+                                   is_multi_agent: bool = False,
+                                   agents: List[str] = None,
+                                   model: str = None,
+                                   depth: str = "standard") -> TestSuite:
+        extra = f"\n\nAnalyze this {app_type} application screen recording.\n" \
+                f"Context: {description or 'None provided'}\n\n" \
+                "Watch for interactions, navigation, form submissions, error states, loading states.\n" \
+                "Generate tests replicating and extending observed behaviors, " \
+                "but ONLY within the selected focus areas above."
+
+        req = GenerateRequest(app_type=app_type, description=description, focus_areas=focus_areas, range_config=rc, is_multi_agent=is_multi_agent, agents=agents, model=model, depth=depth)
+        vid = {"mime_type": media_type, "data": base64.b64decode(b64)}
+        
+        if is_multi_agent and agents:
+            return await self._generate_swarm(req, "video", None, image_data=vid, extra_context=extra)
+            
+        return await self._generate_batched(req, "video", None, image_data=vid, extra_context=extra)
+
+    # ── BUG SCAN ──────────────────────────────────────────────────────────────
+    async def bug_scan(self, app_type: str, description: str, url: Optional[str] = None,
+                       depth: str = "standard", categories: Optional[List[str]] = None) -> dict:
+        depth_inst = DEPTH_INSTRUCTIONS.get(depth, DEPTH_INSTRUCTIONS["standard"])
+        cat_inst = ""
+        if categories:
+            cat_inst = f"\nFocus specifically on these bug categories: {', '.join(categories)}."
+
+        ctx = f"URL: {url}\n" if url else ""
+        prompt = BUG_SYSTEM.format(depth_instruction=depth_inst + cat_inst) + f"""
+
+Scan this {app_type} application:
+{ctx}Description: {description or 'General application'}
+
+Scan depth: {depth.upper()} — {depth_inst}
+Be thorough — include security, performance, accessibility, UX, and logic issues."""
+        text, mname = self._try(prompt, prefer_key="pro")
+        data = _parse(text)
+        data.update({
+            "scan_id":    str(uuid.uuid4()),
+            "app_type":   app_type,
+            "model_used": MODEL_LABELS.get(mname, mname),
+            "scanned_at": datetime.now().isoformat(),
+            "depth":      depth,
+        })
+        return data
+
+    # ── Status / Reset ────────────────────────────────────────────────────────
+    def get_model_status(self) -> dict:
+        keys = self._get_keys()
+        return {
+            mkey: {
+                "name": MODEL_LABELS.get(mname, mname),
+                "model_id": mname,
+                "slot": i + 1,
+                "has_key": bool(keys.get(i + 1) or keys.get(1)),
+                "quota_exhausted": self._quota.get(mkey, False),
+            }
+            for i, (mkey, mname) in enumerate(MODEL_CHAIN)
+        }
+
+    def reset_quota(self):
+        self._quota.clear()
+
+    async def generate_daily_blogs(self) -> List[dict]:
+        reports_dir = Path(__file__).parent.parent / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        
+        prompt = """You are QAForge Blog Writer. Generate 3 unique, high-quality QA engineering blog posts for today.
+Themes: AI testing, automation testing, and AI-powered manual-to-automation testing transitions.
+Author: Akhil Saxena
+Role: Software Tester at Navoto
+
+OUTPUT ONLY valid JSON — no markdown, no backticks.
+Structure:
+[
+  {
+    "id": "blog-001",
+    "title": "string",
+    "summary": "string (2 sentences)",
+    "content": "string (detailed article with 3-4 paragraphs)",
+    "category": "AI|Automation|Manual-AI",
+    "read_time": "3-5 min read",
+    "author": "Akhil Saxena",
+    "author_role": "Software Tester at Navoto",
+    "image_keyword": "string (1-2 search keywords for Unsplash, e.g. 'coding' or 'robot')"
+  },
+  ...
+]"""
+        try:
+            # Use gemini-2.5-flash which we know exists
+            text, mname = await asyncio.to_thread(self._try, prompt, None, "flash") # type: ignore
+            data = _parse(text)
+            date_str = datetime.now().strftime("%b %d, %Y")
+            if isinstance(data, list):
+                for b in data:
+                    b["date"] = date_str
+                return data
+            return []
+        except Exception as e:
+            err_msg = f"[QAForge] Blog generation failed: {e}"
+            print(err_msg)
+            try:
+                (reports_dir / "blog_error.log").write_text(err_msg)
+            except: pass
+            return []
